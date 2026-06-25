@@ -1,10 +1,10 @@
 streamlit
 python-dotenv
 chromadb
-llama-index-core
-llama-index-vector-stores-chroma
-llama-index-embeddings-google-genai
-llama-index-llms-google-genai
-google-generativeai
+llama-index-core==0.14.7
+llama-index-vector-stores-chroma==0.5.3
+llama-index-embeddings-google-genai==0.3.1
+llama-index-llms-google-genai==0.7.1
+google-genai==1.48.0
 Pillow
 requests

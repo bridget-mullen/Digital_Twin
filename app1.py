@@ -34,6 +34,9 @@ from PIL import Image
 import requests
 from io import BytesIO
 import base64
+# Modern Google GenAI SDK (replaces the deprecated `google.generativeai`).
+from google import genai as genai_sdk
+from google.genai import types as genai_types
 
 load_dotenv()
 
@@ -91,17 +94,23 @@ class ArtHistorianTwin:
         self.chroma_persist_dir = chroma_persist_dir
         self.google_api_key = google_api_key
         
-        # Initialize Gemini models
+        # Initialize Gemini models.
+        # NOTE: text-embedding-004 was retired by Google (returns 404); the
+        # current model is gemini-embedding-001. The chroma_db index must be
+        # built with the SAME model used here (see rebuild_index.py).
         self.embed_model = GoogleGenAIEmbedding(
-            model_name="models/text-embedding-004",
+            model_name="gemini-embedding-001",
             api_key=google_api_key
         )
-        
+
         self.llm = GoogleGenAI(
             model="gemini-2.5-flash",
             api_key=google_api_key,
             temperature=0.7
         )
+
+        # Modern google-genai client used for image (vision) calls below.
+        self._genai = genai_sdk.Client(api_key=google_api_key)
         
         # Configure LlamaIndex
         LlamaSettings.embed_model = self.embed_model
@@ -112,7 +121,33 @@ class ArtHistorianTwin:
         self.chroma_client = None
         self.index = None
         self.query_engine = None
-    
+
+    def _vision_generate(self, parts, max_output_tokens=2048, temperature=0.7,
+                         top_p=None, top_k=None) -> str:
+        """Vision/text generation via the modern google-genai SDK.
+
+        `parts` is a list like [prompt_text, pil_image]. Returns the text.
+        Replaces the deprecated google.generativeai `GenerativeModel` +
+        `generate_content(...).resolve()` pattern.
+        """
+        cfg_kwargs = {
+            "temperature": temperature,
+            "max_output_tokens": max_output_tokens,
+            # Turn thinking off so the token budget goes to the visible answer —
+            # gemini-2.5-flash can otherwise spend it all thinking and return "".
+            "thinking_config": genai_types.ThinkingConfig(thinking_budget=0),
+        }
+        if top_p is not None:
+            cfg_kwargs["top_p"] = top_p
+        if top_k is not None:
+            cfg_kwargs["top_k"] = top_k
+        resp = self._genai.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=parts,
+            config=genai_types.GenerateContentConfig(**cfg_kwargs),
+        )
+        return (resp.text or "").strip()
+
     def ingest_documents(self, documents_dir: str, force_reload: bool = False):
         """Ingest and index documents"""
         # Check if index exists
@@ -255,25 +290,11 @@ YOUR RESPONSE (as {self.expert_name}):"""
     def get_initial_image_description(self, image_pil: Image.Image) -> str:
         """Get initial detailed description of image for caching"""
         try:
-            import google.generativeai as genai
-            
-            genai.configure(api_key=self.google_api_key)
-            
-            generation_config = {
-                'temperature': 0.4,
-                'max_output_tokens': 1024,
-            }
-            
-            vision_model = genai.GenerativeModel(
-                'gemini-2.5-flash',
-                generation_config=generation_config
-            )
-            
             # Resize image if needed
             max_size = 1024
             if max(image_pil.size) > max_size:
                 image_pil.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
-            
+
             prompt = """Provide a detailed description of this artwork covering:
 - Visual elements (composition, colors, figures, objects, architectural features)
 - Art style and technique (brushwork, materials, perspective)
@@ -282,15 +303,11 @@ YOUR RESPONSE (as {self.expert_name}):"""
 - Period indicators
 
 Be thorough but concise (3-4 paragraphs)."""
-            
-            response = vision_model.generate_content(
-                [prompt, image_pil],
-                request_options={'timeout': 45}
+
+            return self._vision_generate(
+                [prompt, image_pil], max_output_tokens=1024, temperature=0.4
             )
-            
-            response.resolve()
-            return response.text.strip()
-            
+
         except Exception as e:
             raise Exception(f"Error getting image description: {str(e)}")
     
@@ -349,27 +366,11 @@ YOUR RESPONSE:"""
             raise ValueError("Must ingest documents first")
         
         try:
-            import google.generativeai as genai
-            
-            genai.configure(api_key=self.google_api_key)
-            
-            generation_config = {
-                'temperature': 0.7,
-                'top_p': 0.95,
-                'top_k': 40,
-                'max_output_tokens': 2048,
-            }
-            
-            vision_model = genai.GenerativeModel(
-                'gemini-2.5-flash',
-                generation_config=generation_config
-            )
-            
             # Resize image if too large
             max_size = 1024
             if max(image_pil.size) > max_size:
                 image_pil.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
-            
+
             # Step 1: Get detailed image description (will be cached)
             description_prompt = """Describe this artwork in detail covering:
 - Visual elements, composition, colors
@@ -377,24 +378,16 @@ YOUR RESPONSE:"""
 - Cultural/regional characteristics
 - Symbolic elements
 Be thorough but concise (3-4 paragraphs)."""
-            
-            desc_response = vision_model.generate_content(
-                [description_prompt, image_pil],
-                request_options={'timeout': 45}
+            image_description = self._vision_generate(
+                [description_prompt, image_pil], max_output_tokens=1024, temperature=0.7
             )
-            desc_response.resolve()
-            image_description = desc_response.text.strip()
-            
+
             # Step 2: Generate RAG query
             query_prompt = "In 3-5 keywords, describe: art style, period, cultural origin visible in this image."
-            
-            query_response = vision_model.generate_content(
-                [query_prompt, image_pil],
-                request_options={'timeout': 30}
+            rag_query = self._vision_generate(
+                [query_prompt, image_pil], max_output_tokens=200, temperature=0.7
             )
-            query_response.resolve()
-            rag_query = query_response.text.strip()
-            
+
             # Step 3: Retrieve context from RAG
             rag_response = self.query(rag_query)
             context = rag_response['response'][:2000]
@@ -431,14 +424,13 @@ Write in your characteristic voice (3-4 paragraphs).
 
 YOUR ANALYSIS:"""
             
-            final_response = vision_model.generate_content(
-                [analysis_prompt, image_pil],
-                request_options={'timeout': 45}
+            final_text = self._vision_generate(
+                [analysis_prompt, image_pil], max_output_tokens=2048,
+                temperature=0.7, top_p=0.95, top_k=40
             )
-            final_response.resolve()
-            
+
             return {
-                'response': final_response.text,
+                'response': final_text,
                 'rag_query': rag_query,
                 'sources': sources,
                 'has_image': True,
